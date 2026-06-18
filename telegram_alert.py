@@ -49,8 +49,8 @@ async def check_gpu_stock(cookie_file):
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled", "--window-position=-3000,-3000",
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-gpu",
                   "--no-first-run", "--no-default-browser-check"]
         )
         ctx = await browser.new_context(
