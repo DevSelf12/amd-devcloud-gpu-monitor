@@ -298,9 +298,13 @@ def main():
             gpus, deployed = None, None
 
         if gpus:
-            alert = format_alert(gpus, deployed)
-            send_tg(tg_token, tg_chat, alert)
-            log.info("Alert sent")
+            has_stock = any(g["in_stock"] for g in gpus)
+            if has_stock:
+                alert = format_alert(gpus, deployed)
+                send_tg(tg_token, tg_chat, alert)
+                log.info("Alert sent (stock available)")
+            else:
+                log.info("All GPU out of stock — skip notif")
             if deployed:
                 log.info("Deploy completed — exiting after auto-deploy!")
                 break
