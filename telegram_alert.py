@@ -75,15 +75,24 @@ def format_alert(gpu_sizes):
     now = datetime.now().strftime("%H:%M:%S")
     available = [s for s in gpu_sizes if len(s.get("region_ids", [])) > 0]
     if available:
-        lines = [f"🟢 *GPU AVAILABLE — AMD Dev Cloud*", f"🕐 {now}\n"]
+        lines = [f"🚨🚨🚨 *STOK ADA!!! AMD MI300X AVAILABLE!* 🚨🚨🚨", f"🕐 {now}", ""]
         for s in available:
             gpu = s["gpu_info"]
             lines.append(f"✅ *{s['name']}*")
             lines.append(f"   {gpu['count']}x {gpu['model'].upper()} ({gpu['vram']['amount']}GB VRAM)")
             lines.append(f"   ${s['price_per_hour']}/hr")
-        lines.append(f"\n🔗 https://devcloud.amd.com/gpus")
+        lines.append("")
+        lines.append("⚡ *LANGSUNG DEPLOY SEKARANG:*")
+        lines.append("🔗 https://devcloud.amd.com/gpus")
     else:
-        lines = [f"🔴 All GPUs out of stock — {now}"]
+        lines = [
+            f"🔴 Monitor — {now}",
+            "",
+            f"🔴 1x MI300X (192GB) — kosong",
+            f"🔴 8x MI300X (1536GB) — kosong",
+            "",
+            f"_Next check dalam 60 detik..._",
+        ]
     return "\n".join(lines)
 
 def main():
@@ -98,21 +107,26 @@ def main():
         sys.exit(1)
 
     log.info(f"Monitoring AMD Dev Cloud GPU stock (interval: {interval}s)")
-    last_status = None
+
+    # Send startup notification
+    requests.post(
+        f"https://api.telegram.org/bot{tg_token}/sendMessage",
+        json={"chat_id": tg_chat, "text": "✅ AMD GPU Monitor started! Checking every " + str(interval) + "s"},
+        timeout=10
+    )
 
     while True:
         sizes = check_stock(cookie_file)
         if sizes:
-            current = tuple(len(s.get("region_ids", [])) > 0 for s in sizes)
-            if current != last_status:
-                alert = format_alert(sizes)
-                r = requests.post(
-                    f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                    json={"chat_id": tg_chat, "text": alert, "parse_mode": "Markdown"},
-                    timeout=10
-                )
-                log.info(f"Alert sent ({r.status_code})")
-                last_status = current
+            alert = format_alert(sizes)
+            r = requests.post(
+                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                json={"chat_id": tg_chat, "text": alert, "parse_mode": "Markdown"},
+                timeout=10
+            )
+            log.info(f"Alert sent ({r.status_code})")
+        else:
+            log.warning("Check failed — cookies expired?")
         time.sleep(interval)
 
 if __name__ == "__main__":
