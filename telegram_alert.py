@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 AMD Dev Cloud — Telegram Alert Bot
-Standalone version with inline cookie loading.
+Uses Playwright to intercept GraphQL. Sends Telegram every check.
 """
 
-import json, time, sys, os, logging
+import json, time, sys, os, logging, asyncio
 from datetime import datetime
 from pathlib import Path
 
@@ -17,30 +17,20 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("amd-tg")
 
-GRAPHQL_URL = "https://devcloud.amd.com/graphql"
-TEAM_ID = "0dd79f"
-
-GRAPHQL_QUERY = {
-    "operationName": "dropletOptions",
-    "variables": {"dropletOptionsParams": {"type": "gpus"}},
-    "query": """query dropletOptions($dropletOptionsParams: ListDropletOptionsRequest) {
-  dropletOptions(dropletOptionsParams: $dropletOptionsParams) {
-    sizes {
-      name restriction id
-      gpu_info { vram { unit amount } model count }
-      price_per_month price_per_hour cpu_count memory_in_bytes region_ids
-    }
-    __typename
-  }
-}"""
-}
+GPU_URL = "https://devcloud.amd.com/gpus?i=0dd79f"
 
 def load_cookies(path):
     with open(path) as f:
         data = json.load(f)
     if isinstance(data, list):
-        return {c["name"]: c["value"] for c in data if "name" in c}
-    return data
+        for c in data:
+            c.setdefault("domain", ".devcloud.amd.com")
+            c.setdefault("path", "/")
+            c.setdefault("sameSite", "None")
+            c.setdefault("secure", True)
+            c.setdefault("httpOnly", False)
+        return data
+    return [{"name": k, "value": v, "domain": ".devcloud.amd.com", "path": "/"} for k, v in data.items()]
 
 def load_env():
     env_file = Path(__file__).parent / ".env"
@@ -51,49 +41,94 @@ def load_env():
                 k, _, v = line.partition("=")
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-def check_stock(cookie_file):
+async def check_gpu_stock(cookie_file):
+    from playwright.async_api import async_playwright
+
     cookies = load_cookies(cookie_file)
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json", "Content-Type": "application/json",
-        "Referer": "https://devcloud.amd.com/gpus",
-        "Origin": "https://devcloud.amd.com",
-    })
-    for name, value in cookies.items():
-        domain = ".devcloud.amd.com" if name.startswith("_") else "devcloud.amd.com"
-        s.cookies.set(name, value, domain=domain)
+    result = {}
 
-    r = s.post(f"{GRAPHQL_URL}?i={TEAM_ID}", json=GRAPHQL_QUERY, timeout=15)
-    if r.status_code != 200:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--window-position=-3000,-3000",
+                  "--no-first-run", "--no-default-browser-check"]
+        )
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+        )
+        await ctx.add_cookies(cookies)
+        page = await ctx.new_page()
+        await page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+
+        async def on_resp(response):
+            if "graphql" in response.url and response.request.method == "POST":
+                try:
+                    req = json.loads(response.request.post_data or "{}")
+                    body = await response.text()
+                    if req.get("operationName") == "dropletOptions" and "gpu_info" in body:
+                        result["data"] = json.loads(body)
+                except:
+                    pass
+
+        page.on("response", on_resp)
+        try:
+            await page.goto(GPU_URL, wait_until="domcontentloaded", timeout=30000)
+            for _ in range(15):
+                await asyncio.sleep(2)
+                if "data" in result:
+                    break
+        except:
+            pass
+        finally:
+            await browser.close()
+
+    if "data" not in result:
         return None
-    data = r.json()
-    sizes = data.get("data", {}).get("dropletOptions", {}).get("sizes", [])
-    return [s for s in sizes if s.get("gpu_info")]
 
-def format_alert(gpu_sizes):
+    sizes = result["data"].get("data", {}).get("dropletOptions", {}).get("sizes", [])
+    out = []
+    for s in sizes:
+        if not s.get("gpu_info"):
+            continue
+        g = s["gpu_info"]
+        out.append({
+            "name": s["name"],
+            "model": g["model"],
+            "count": g["count"],
+            "vram": int(g["vram"]["amount"]),
+            "price": s["price_per_hour"],
+            "regions": s.get("region_ids", []),
+            "restriction": s.get("restriction"),
+            "in_stock": len(s.get("region_ids", [])) > 0,
+        })
+    return out
+
+def format_alert(gpus):
     now = datetime.now().strftime("%H:%M:%S")
-    available = [s for s in gpu_sizes if len(s.get("region_ids", [])) > 0]
+    available = [g for g in gpus if g["in_stock"]]
     if available:
         lines = [f"🚨🚨🚨 *STOK ADA!!! AMD MI300X AVAILABLE!* 🚨🚨🚨", f"🕐 {now}", ""]
-        for s in available:
-            gpu = s["gpu_info"]
-            lines.append(f"✅ *{s['name']}*")
-            lines.append(f"   {gpu['count']}x {gpu['model'].upper()} ({gpu['vram']['amount']}GB VRAM)")
-            lines.append(f"   ${s['price_per_hour']}/hr")
-        lines.append("")
-        lines.append("⚡ *LANGSUNG DEPLOY SEKARANG:*")
-        lines.append("🔗 https://devcloud.amd.com/gpus")
+        for g in available:
+            lines.append(f"✅ *{g['count']}x {g['model'].upper()}* ({g['vram']}GB VRAM)")
+            lines.append(f"   ${g['price']}/hr")
+            if g["restriction"]:
+                lines.append(f"   ⚠️ {g['restriction']}")
+        lines += ["", "⚡ *LANGSUNG DEPLOY SEKARANG:*", "🔗 https://devcloud.amd.com/gpus"]
     else:
-        lines = [
-            f"🔴 Monitor — {now}",
-            "",
-            f"🔴 1x MI300X (192GB) — kosong",
-            f"🔴 8x MI300X (1536GB) — kosong",
-            "",
-            f"_Next check dalam 60 detik..._",
-        ]
+        lines = [f"🔴 Monitor — {now}", ""]
+        for g in gpus:
+            lines.append(f"🔴 {g['count']}x {g['model'].upper()} ({g['vram']}GB) — kosong")
+        lines += ["", "_Next check dalam 60 detik..._"]
     return "\n".join(lines)
+
+def send_tg(token, chat_id, text):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        return r.status_code == 200
+    except:
+        return False
 
 def main():
     load_env()
@@ -103,30 +138,26 @@ def main():
     interval = int(os.environ.get("CHECK_INTERVAL", "60"))
 
     if not tg_token or not tg_chat:
-        print("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
+        log.error("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env or env vars")
         sys.exit(1)
 
-    log.info(f"Monitoring AMD Dev Cloud GPU stock (interval: {interval}s)")
-
-    # Send startup notification
-    requests.post(
-        f"https://api.telegram.org/bot{tg_token}/sendMessage",
-        json={"chat_id": tg_chat, "text": "✅ AMD GPU Monitor started! Checking every " + str(interval) + "s"},
-        timeout=10
-    )
+    log.info(f"Monitoring (interval: {interval}s)")
+    send_tg(tg_token, tg_chat, f"✅ AMD GPU Monitor started! Checking every {interval}s")
 
     while True:
-        sizes = check_stock(cookie_file)
-        if sizes:
-            alert = format_alert(sizes)
-            r = requests.post(
-                f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                json={"chat_id": tg_chat, "text": alert, "parse_mode": "Markdown"},
-                timeout=10
-            )
-            log.info(f"Alert sent ({r.status_code})")
+        try:
+            gpus = asyncio.run(check_gpu_stock(cookie_file))
+        except Exception as e:
+            log.error(f"Error: {e}")
+            gpus = None
+
+        if gpus:
+            alert = format_alert(gpus)
+            send_tg(tg_token, tg_chat, alert)
+            log.info("Alert sent")
         else:
-            log.warning("Check failed — cookies expired?")
+            log.warning("Check failed — cookies expired? Re-export from browser.")
+
         time.sleep(interval)
 
 if __name__ == "__main__":
