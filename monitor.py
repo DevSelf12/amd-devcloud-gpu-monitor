@@ -173,10 +173,13 @@ def main():
             report = format_report(gpus)
             print(report)
             cur = tuple(g["in_stock"] for g in gpus)
+            any_stock = any(cur)
             if cur != last:
-                if args.telegram and tg_token and tg_chat:
+                if args.telegram and tg_token and tg_chat and any_stock:
                     send_telegram(tg_token, tg_chat, report)
-                    log.info("TG alert sent")
+                    log.info("TG alert sent (stock available)")
+                elif args.telegram and not any_stock:
+                    log.info("TG alert skipped (all out of stock)")
                 last = cur
         else:
             log.warning("Gagal ambil data GPU")
