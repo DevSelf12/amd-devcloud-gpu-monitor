@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-AMD Dev Cloud — GPU Monitor + Auto-Deploy
+AMD Dev Cloud — GPU Monitor + Auto-Deploy (v3 persistent context)
 Monitors MI300X stock and auto-deploys when available.
+Uses Playwright persistent browser_data/ (setup via: python3 monitor.py --setup cookies.json)
 
 Usage:
-  python telegram_alert.py                    # Monitor only
+  python telegram_alert.py                    # Monitor only (alerts on stock change)
   python telegram_alert.py --auto-deploy      # Monitor + auto-deploy
 """
 
@@ -24,24 +25,12 @@ log = logging.getLogger("amd-gpu")
 GPU_URL = "https://devcloud.amd.com/gpus?i=0dd79f"
 CREATE_URL = "https://devcloud.amd.com/droplets/new?i=0dd79f"
 GRAPHQL_URL = "https://devcloud.amd.com/graphql?i=0dd79f"
+BROWSER_DATA_DIR = str(Path(__file__).parent / "browser_data")
 
 # Config
 SSH_KEY_ID = 57192576       # "Termux"
 GPU_SIZE_ID = "325"         # gpu-mi300x1-192gb-devcloud (1x MI300X)
 TEAM_ID = "0dd79f"
-
-def load_cookies(path):
-    with open(path) as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        for c in data:
-            c.setdefault("domain", ".devcloud.amd.com")
-            c.setdefault("path", "/")
-            c.setdefault("sameSite", "None")
-            c.setdefault("secure", True)
-            c.setdefault("httpOnly", False)
-        return data
-    return [{"name": k, "value": v, "domain": ".devcloud.amd.com", "path": "/"} for k, v in data.items()]
 
 def load_env():
     env_file = Path(__file__).parent / ".env"
@@ -52,24 +41,36 @@ def load_env():
                 k, _, v = line.partition("=")
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-async def check_and_deploy(cookie_file, auto_deploy=False):
-    """Check GPU stock. If auto_deploy and stock found, deploy immediately."""
+async def check_and_deploy(auto_deploy=False):
+    """Check GPU stock using persistent browser context. Auto-deploy if enabled."""
     from playwright.async_api import async_playwright
 
-    cookies = load_cookies(cookie_file)
+    if not Path(BROWSER_DATA_DIR).exists():
+        log.error(f"No browser session! Run first: python3 monitor.py --setup cookies.json")
+        return None, None
+
     result = {"gpus": None, "images": [], "deployed": None}
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=[
-            "--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-gpu"
-        ])
-        ctx = await browser.new_context(
+        browser = await p.chromium.launch_persistent_context(
+            BROWSER_DATA_DIR,
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720},
         )
-        await ctx.add_cookies(cookies)
-        page = await ctx.new_page()
-        await page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+
+        page = browser.pages[0] if browser.pages else await browser.new_page()
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
+        """)
 
         # Capture dropletOptions for stock check
         async def on_resp(response):
@@ -95,6 +96,17 @@ async def check_and_deploy(cookie_file, auto_deploy=False):
                 await asyncio.sleep(2)
                 if result["gpus"]:
                     break
+        except:
+            pass
+
+        # Check if redirected to login (session expired)
+        try:
+            current_url = page.url
+            if "sign_in" in current_url or "login" in current_url:
+                log.error("Session expired! Redirected to login page.")
+                log.error("Re-setup: python3 monitor.py --setup cookies.json")
+                await browser.close()
+                return None, None
         except:
             pass
 
@@ -139,7 +151,7 @@ async def check_and_deploy(cookie_file, auto_deploy=False):
                 except:
                     pass
 
-            page2 = await ctx.new_page()
+            page2 = await browser.new_page()
             page2.on("response", on_resp2)
             await page2.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
 
@@ -279,25 +291,30 @@ def main():
     load_env()
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     tg_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
-    cookie_file = os.environ.get("COOKIE_FILE", str(Path(__file__).parent / "cookies.json"))
     interval = int(os.environ.get("CHECK_INTERVAL", "60"))
 
     if not tg_token or not tg_chat:
         log.error("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
         sys.exit(1)
 
+    if not Path(BROWSER_DATA_DIR).exists():
+        log.error(f"No browser session! Run first: python3 monitor.py --setup cookies.json")
+        sys.exit(1)
+
     mode = "Monitor + Auto-Deploy" if args.auto_deploy else "Monitor only"
     log.info(f"Starting ({mode}, interval: {interval}s)")
     send_tg(tg_token, tg_chat, f"✅ AMD GPU Monitor started!\nMode: {mode}\nInterval: {interval}s")
 
+    fail_count = 0
     while True:
         try:
-            gpus, deployed = asyncio.run(check_and_deploy(cookie_file, args.auto_deploy))
+            gpus, deployed = asyncio.run(check_and_deploy(args.auto_deploy))
         except Exception as e:
             log.error(f"Error: {e}")
             gpus, deployed = None, None
 
         if gpus:
+            fail_count = 0
             has_stock = any(g["in_stock"] for g in gpus)
             if has_stock:
                 alert = format_alert(gpus, deployed)
@@ -309,7 +326,18 @@ def main():
                 log.info("Deploy completed — exiting after auto-deploy!")
                 break
         else:
-            log.warning("Check failed — cookies expired?")
+            fail_count += 1
+            log.warning("Check failed — session expired?")
+            if fail_count >= 3:
+                msg = ("⚠️ AMD Monitor: 3x gagal! Session expired.\n\n"
+                       "Re-setup:\n"
+                       "1. Export FRESH cookies dari browser\n"
+                       "2. scp cookies.json ke VPS\n"
+                       "3. python3 monitor.py --setup cookies.json\n"
+                       "4. Restart: python3 telegram_alert.py")
+                send_tg(tg_token, tg_chat, msg)
+                log.error("3x fail — sent alert, stopping.")
+                break
 
         time.sleep(interval)
 
