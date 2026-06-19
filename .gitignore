@@ -19,6 +19,9 @@ env/
 *.log
 monitor.log
 
+# Browser persistent data (Playwright)
+browser_data/
+
 # OS
 .DS_Store
 Thumbs.db
