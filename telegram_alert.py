@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-AMD Dev Cloud — GPU Monitor + Instant Auto-Deploy (v5)
-Persistent session + auto-recovery via remember_me cookie.
+AMD Dev Cloud GPU Monitor + Instant Auto-Deploy (v7)
+Imports cookies at startup. Handles session expiry with retry.
 
 Usage:
-  python3 telegram_alert.py                    # Monitor only
-  python3 telegram_alert.py --auto-deploy      # Monitor + instant deploy
-
-Setup:
-  python3 monitor.py --setup cookies.json      # First time (import fresh cookies)
+  python telegram_alert.py cookies.json              # Monitor only
+  python telegram_alert.py cookies.json --auto-deploy # Monitor + auto-deploy
 """
 
 import json, time, sys, os, logging, asyncio, argparse
@@ -25,26 +22,37 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("amd-gpu")
 
 GPU_URL = "https://devcloud.amd.com/gpus?i=0dd79f"
-CREATE_URL = "https://devcloud.amd.com/droplets/new?i=0dd79f"
-LOGIN_URL = "https://devcloud.amd.com/users/sign_in"
 BROWSER_DATA_DIR = str(Path(__file__).parent / "browser_data")
+SSH_KEY_ID = 57192576
+IMAGE_FALLBACK = "195932981"
 
-# Deploy config
-SSH_KEY_ID = 57192576  # "Termux"
-
-ANTI_DETECT = """
-    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
-"""
+SAME_SITE_MAP = {"strict": "Strict", "lax": "Lax", "no_restriction": "None", "none": "None", None: "None"}
 
 def load_env():
-    env_file = Path(__file__).parent / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    for line in (Path(__file__).parent / ".env").read_text().splitlines() if (Path(__file__).parent / ".env").exists() else []:
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+def load_cookies(path):
+    with open(path) as f:
+        data = json.load(f)
+    cookies = []
+    for c in data:
+        cookie = {
+            "name": c["name"], "value": c["value"],
+            "domain": c.get("domain", ".devcloud.amd.com"),
+            "path": c.get("path", "/"),
+            "secure": c.get("secure", True),
+            "httpOnly": c.get("httpOnly", False),
+        }
+        raw_ss = c.get("sameSite")
+        cookie["sameSite"] = SAME_SITE_MAP.get(raw_ss.lower(), "None") if isinstance(raw_ss, str) else "None"
+        if "expirationDate" in c and c.get("expirationDate") and not c.get("session", False):
+            cookie["expires"] = float(c["expirationDate"])
+        cookies.append(cookie)
+    return cookies
 
 def send_tg(token, chat_id, text):
     try:
@@ -54,49 +62,69 @@ def send_tg(token, chat_id, text):
     except:
         return False
 
-async def try_refresh_session(ctx):
-    """
-    Attempt to refresh session by visiting login page.
-    _digitalocean_remember_me cookie should auto-login the user.
-    Returns True if session was recovered.
-    """
-    log.info("Attempting session recovery via remember_me...")
+def extract_images(gql_data):
+    images = {}
+    for d in gql_data.get("data", {}).get("dropletOptions", {}).get("distributions", []):
+        for img in d.get("images", []):
+            if "rocm" in img.get("name", "").lower() or "rocm" in d.get("name", "").lower():
+                images["rocm"] = img["id"]
+            elif "24.04" in img.get("name", "") and "ubuntu" in d.get("name", "").lower():
+                images["ubuntu-24"] = img["id"]
+    return images
+
+async def do_deploy(ctx, available, cached_images, region, tg_token, tg_chat):
+    target = available[0]
+    ts = datetime.now().strftime("%H:%M:%S")
+    size_id = target["id"]
+    image_id = cached_images.get("rocm") or cached_images.get("ubuntu-24") or IMAGE_FALLBACK
+    log.info(f"Deploy: size={size_id} image={image_id} region={region}")
+
     page = await ctx.new_page()
-    await page.add_init_script(ANTI_DETECT)
+    await page.add_init_script("""
+        Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+        window.chrome={runtime:{},loadTimes:function(){},csi:function(){}};
+    """)
     try:
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=20000)
-        await asyncio.sleep(5)
+        await page.goto(GPU_URL, wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(2)
+        raw = await page.evaluate("""
+            async (p) => {
+                try {
+                    const r = await fetch('/graphql?i=0dd79f', {
+                        method:'POST', credentials:'include',
+                        headers:{'Content-Type':'application/json','apollographql-client-name':'ui-droplets','apollographql-client-version':'2026.6.17'},
+                        body: JSON.stringify({operationName:'DropletCreate',
+                            query:`mutation DropletCreate($req:DropletCreateRequest){createDroplet(DropletCreateRequest:$req){droplet{id name}}}`,
+                            variables:{req:{name:'gpu-mi300x-auto',size:p.sizeId,image:p.imageId,region:p.regionId,ssh_keys:[p.sshKeyId],monitoring:true,with_droplet_agent:true}}})
+                    });
+                    return await r.text();
+                } catch(e) { return JSON.stringify({error:e.message}); }
+            }
+        """, {"sizeId": size_id, "imageId": image_id, "regionId": str(region), "sshKeyId": SSH_KEY_ID})
 
-        current = page.url
-        # If NOT on login page anymore, remember_me worked
-        if "sign_in" not in current and "login" not in current:
-            log.info(f"✅ Session recovered! Redirected to: {current}")
-            await page.close()
+        result = json.loads(raw)
+        if "data" in result and result["data"].get("createDroplet", {}).get("droplet"):
+            d = result["data"]["createDroplet"]["droplet"]
+            msg = f"🚀🚀🚀 *GPU DEPLOYED!!!* 🚀🚀🚀\n\n✅ Name: `{d['name']}`\n✅ ID: `{d['id']}`\n🕐 {ts}\n\n🔗 https://devcloud.amd.com/droplets/{d['id']}"
+            send_tg(tg_token, tg_chat, msg)
+            log.info(f"✅ DEPLOYED! {d['name']} ({d['id']})")
             return True
-
-        # Check if page has a dashboard link or user menu (logged in)
-        try:
-            content = await page.content()
-            if "sign_out" in content or "dashboard" in content or "droplets" in content:
-                log.info("✅ Session seems alive (page has logged-in elements)")
-                await page.close()
-                return True
-        except:
-            pass
-
-        log.warning("❌ Still on login page. remember_me expired or invalid.")
-        await page.close()
-        return False
+        elif "errors" in result:
+            err = result["errors"][0].get("message", "?")
+            log.error(f"Deploy error: {err}")
+            send_tg(tg_token, tg_chat, f"🚨 Deploy gagal: `{err}`\n⚡ https://devcloud.amd.com/gpus")
+        else:
+            log.error(f"Unexpected: {raw[:300]}")
+            send_tg(tg_token, tg_chat, f"🚨 Deploy error!\n⚡ https://devcloud.amd.com/gpus")
     except Exception as e:
-        log.warning(f"Recovery attempt error: {e}")
-        try:
-            await page.close()
-        except:
-            pass
-        return False
+        log.error(f"Deploy exception: {e}")
+        send_tg(tg_token, tg_chat, f"🚨 Deploy error: `{e}`\n⚡ https://devcloud.amd.com/gpus")
+    finally:
+        await page.close()
+    return False
 
-async def fetch_gpu_stock(page):
-    """Navigate to GPU page and capture stock data."""
+async def check_stock(page):
+    """Single stock check on existing page. Returns (gpus, gql_data) or (None, None) if session expired."""
     gql_result = None
 
     async def on_gql(response):
@@ -105,10 +133,10 @@ async def fetch_gpu_stock(page):
             return
         try:
             req = json.loads(response.request.post_data or "{}")
-            if req.get("operationName") == "dropletOptions":
-                body = await response.text()
-                if "gpu_info" in body:
-                    gql_result = json.loads(body)
+            body = await response.text()
+            resp = json.loads(body)
+            if "errors" not in resp and req.get("operationName") == "dropletOptions" and "gpu_info" in body:
+                gql_result = resp
         except:
             pass
 
@@ -120,211 +148,175 @@ async def fetch_gpu_stock(page):
             if gql_result:
                 break
 
-        # Check login redirect
-        if "sign_in" in page.url or "login" in page.url:
-            return None, "login_redirect"
+        # Check if redirected to login (real login page, not Cloudflare)
+        url = page.url
+        if "/sign_in" in url or "/login" in url:
+            return None, None, "session_expired"
+
+        if not gql_result:
+            return [], None, "no_data"
 
         gpus = []
-        if gql_result:
-            sizes = gql_result.get("data", {}).get("dropletOptions", {}).get("sizes", [])
-            for s in sizes:
-                if not s.get("gpu_info"):
-                    continue
-                g = s["gpu_info"]
-                gpus.append({
-                    "name": s["name"], "id": s["id"],
-                    "model": g["model"], "count": g["count"],
-                    "vram": int(g["vram"]["amount"]),
-                    "price": s["price_per_hour"],
-                    "regions": s.get("region_ids", []),
-                    "restriction": s.get("restriction"),
-                    "in_stock": len(s.get("region_ids", [])) > 0,
-                })
-        return gpus, None
+        for s in gql_result.get("data", {}).get("dropletOptions", {}).get("sizes", []):
+            if not s.get("gpu_info"):
+                continue
+            g = s["gpu_info"]
+            gpus.append({
+                "name": s["name"], "id": s["id"],
+                "model": g["model"], "count": g["count"],
+                "vram": int(g["vram"]["amount"]),
+                "price": s["price_per_hour"],
+                "regions": s.get("region_ids", []),
+                "restriction": s.get("restriction"),
+                "in_stock": len(s.get("region_ids", [])) > 0,
+            })
+        return gpus, gql_result, "ok"
     except Exception as e:
-        return None, str(e)
+        log.warning(f"Check error: {e}")
+        return None, None, "error"
     finally:
-        try:
-            page.remove_listener("response", on_gql)
-        except:
-            pass
+        page.remove_listener("response", on_gql)
 
-async def deploy_gpu(page, size_id, image_id, region_id):
-    """Execute deploy via fetch on the current page context."""
-    result = await page.evaluate("""
-        async (params) => {
-            try {
-                const resp = await fetch('/graphql?i=0dd79f', {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'apollographql-client-name': 'ui-droplets',
-                        'apollographql-client-version': '2026.6.17-b9202df6d113a55b927b777fadd2511bf5435d06',
-                    },
-                    body: JSON.stringify({
-                        operationName: 'DropletCreate',
-                        query: `mutation DropletCreate($dropletCreateRequest: DropletCreateRequest) {
-                            createDroplet(DropletCreateRequest: $dropletCreateRequest) {
-                                droplet { id name }
-                            }
-                        }`,
-                        variables: {
-                            dropletCreateRequest: {
-                                name: 'gpu-mi300x-autodeploy',
-                                size: params.sizeId,
-                                image: params.imageId,
-                                region: params.regionId,
-                                ssh_keys: [params.sshKeyId],
-                                monitoring: true,
-                                with_droplet_agent: true,
-                            }
-                        }
-                    })
-                });
-                return await resp.text();
-            } catch(e) {
-                return JSON.stringify({error: e.message});
-            }
-        }
-    """, {
-        "sizeId": size_id,
-        "imageId": image_id,
-        "regionId": str(region_id),
-        "sshKeyId": SSH_KEY_ID,
-    })
-    return json.loads(result)
-
-async def run_monitor(interval, tg_token, tg_chat, auto_deploy):
-    """Main monitoring loop with session auto-recovery."""
+async def run_monitor(interval, tg_token, tg_chat, auto_deploy, cookies_file):
     from playwright.async_api import async_playwright
 
-    if not Path(BROWSER_DATA_DIR).exists():
-        log.error(f"No session! Run: python3 monitor.py --setup cookies.json")
-        if tg_token and tg_chat:
-            send_tg(tg_token, tg_chat, "❌ No session!\nRun: python3 monitor.py --setup cookies.json")
+    if not cookies_file and not Path(BROWSER_DATA_DIR).exists():
+        log.error("No cookies file and no browser_data/. Need cookies.json")
         return
 
     async with async_playwright() as p:
         ctx = await p.chromium.launch_persistent_context(
-            BROWSER_DATA_DIR,
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox", "--disable-gpu",
-                "--no-first-run", "--no-default-browser-check",
-            ],
+            BROWSER_DATA_DIR, headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-gpu",
+                  "--no-first-run", "--no-default-browser-check"],
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720},
         )
+        anti = "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});window.chrome={runtime:{},loadTimes:function(){},csi:function(){}};"
 
-        # Pre-warm deploy cache
-        deploy_cache = {"images": {}, "loaded": False}
-        if auto_deploy:
-            log.info("Pre-warming deploy cache...")
-            warm_page = await ctx.new_page()
-            await warm_page.add_init_script(ANTI_DETECT)
-            warm_data = {}
+        # Import cookies at startup (same as --setup but inline)
+        if cookies_file:
+            cookies = load_cookies(cookies_file)
+            await ctx.add_cookies(cookies)
+            log.info(f"Imported {len(cookies)} cookies")
 
-            async def on_warm(response):
-                if "graphql" not in response.url or response.request.method != "POST":
-                    return
+        # Initial visit to establish session (like --setup does)
+        init_page = await ctx.new_page()
+        await init_page.add_init_script(anti)
+        gql_init = None
+        async def on_init(response):
+            nonlocal gql_init
+            if "graphql" in response.url and response.request.method == "POST":
                 try:
-                    warm_data[response.url] = json.loads(await response.text())
+                    req = json.loads(response.request.post_data or "{}")
+                    body = await response.text()
+                    resp = json.loads(body)
+                    if "errors" not in resp and req.get("operationName") == "dropletOptions" and "gpu_info" in body:
+                        gql_init = resp
                 except:
                     pass
+        init_page.on("response", on_init)
+        await init_page.goto(GPU_URL, wait_until="domcontentloaded", timeout=30000)
+        for _ in range(10):
+            await asyncio.sleep(2)
+            if gql_init:
+                break
 
-            warm_page.on("response", on_warm)
-            try:
-                await warm_page.goto(CREATE_URL, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(6)
-                for _, resp in warm_data.items():
-                    data = resp.get("data", {}).get("dropletOptions", {})
-                    for d in data.get("distributions", []):
-                        for img in d.get("images", []):
-                            if "rocm" in img["name"].lower() or "rocm" in d["name"].lower():
-                                deploy_cache["images"]["rocm"] = img["id"]
-                            elif "24.04" in img["name"] and "ubuntu" in d["name"].lower():
-                                deploy_cache["images"]["ubuntu-24"] = img["id"]
-                deploy_cache["loaded"] = True
-                log.info(f"Cache ready: images={deploy_cache['images']}")
-            except Exception as e:
-                log.warning(f"Pre-warm failed: {e}")
-            finally:
-                await warm_page.close()
+        if gql_init:
+            n = sum(1 for s in gql_init.get("data",{}).get("dropletOptions",{}).get("sizes",[]) if s.get("gpu_info"))
+            log.info(f"Session OK ({n} GPU types)")
+        else:
+            url = init_page.url
+            if "/sign_in" in url or "/login" in url:
+                log.error("Cookies already expired! Export FRESH cookies from browser.")
+                if tg_token and tg_chat:
+                    send_tg(tg_token, tg_chat, "❌ Cookies expired at startup! Export FRESH cookies.")
+                await ctx.close()
+                return
+            log.warning("No GraphQL data at startup, continuing anyway...")
 
-        # Monitoring page (reuse)
+        await init_page.close()
+
+        # Main monitoring loop — reuse single page
         check_page = await ctx.new_page()
-        await check_page.add_init_script(ANTI_DETECT)
+        await check_page.add_init_script(anti)
         fail_count = 0
-        recovery_count = 0
+        cached_images = {}
+        session_recovered_count = 0
 
-        mode = "⚡ Fast Deploy" if auto_deploy else "👁 Monitor only"
-        log.info(f"Monitor running ({mode}, interval: {interval}s)")
+        log.info(f"Monitor running (interval: {interval}s, auto-deploy: {auto_deploy})")
         if tg_token and tg_chat:
-            send_tg(tg_token, tg_chat,
-                f"✅ AMD GPU Monitor started!\n"
-                f"Mode: {mode}\n"
-                f"Interval: {interval}s\n"
-                f"Auto-recovery: ✅ enabled")
+            send_tg(tg_token, tg_chat, f"✅ AMD GPU Monitor started!\nMode: {'⚡ Fast Deploy' if auto_deploy else '👁 Monitor'}\nInterval: {interval}s")
 
         while True:
-            # Fetch stock
-            gpus, error = await fetch_gpu_stock(check_page)
+            gpus, gql_data, status = await check_stock(check_page)
 
-            # Handle login redirect with auto-recovery
-            if error == "login_redirect":
-                recovery_count += 1
-                log.warning(f"Session expired (recovery #{recovery_count})")
-
-                recovered = await try_refresh_session(ctx)
-                if recovered:
-                    # Refresh the check page too
-                    try:
-                        await check_page.close()
-                    except:
-                        pass
-                    check_page = await ctx.new_page()
-                    await check_page.add_init_script(ANTI_DETECT)
-                    # Retry immediately
-                    gpus, error = await fetch_gpu_stock(check_page)
-                    if error == "login_redirect":
-                        log.error("Recovery succeeded but still redirected!")
-                        error = "recovery_failed"
-                    else:
-                        recovery_count = 0  # Reset on successful recovery
-                else:
-                    log.error("Auto-recovery failed! Need fresh cookies.")
+            # Handle session expiry
+            if status == "session_expired":
+                session_recovered_count += 1
+                if session_recovered_count > 3:
+                    log.error("Session expired 3x — need fresh cookies")
                     if tg_token and tg_chat:
                         send_tg(tg_token, tg_chat,
-                            "⚠️ Session expired & auto-recovery failed!\n\n"
-                            "Re-setup:\n"
-                            "1. Export FRESH cookies dari browser\n"
-                            "2. scp cookies.json ke VPS\n"
+                            "⚠️ Session expired 3x!\n"
+                            "Re-setup:\n1. Export FRESH cookies\n2. scp ke VPS\n"
                             "3. python3 monitor.py --setup cookies.json")
                     break
 
-            if error and error != "login_redirect":
+                log.warning(f"Session expired (attempt {session_recovered_count}), re-importing cookies...")
+                await check_page.close()
+
+                # Re-import cookies and create fresh page
+                if cookies_file:
+                    cookies = load_cookies(cookies_file)
+                    await ctx.add_cookies(cookies)
+
+                # Try visit login page to trigger remember_me
+                recover_page = await ctx.new_page()
+                await recover_page.add_init_script(anti)
+                try:
+                    await recover_page.goto("https://devcloud.amd.com/users/sign_in", wait_until="domcontentloaded", timeout=20000)
+                    await asyncio.sleep(5)
+                    url = recover_page.url
+                    if "/sign_in" not in url and "/login" not in url:
+                        log.info("Session recovered!")
+                        session_recovered_count = 0
+                except:
+                    pass
+                finally:
+                    await recover_page.close()
+
+                check_page = await ctx.new_page()
+                await check_page.add_init_script(anti)
+                time.sleep(interval)
+                continue
+
+            if status == "error" or gpus is None:
                 fail_count += 1
-                log.warning(f"Check error: {error} (fail #{fail_count})")
-                if fail_count >= 3:
+                log.warning(f"Check error (fail #{fail_count})")
+                if fail_count >= 5:
+                    log.error("5x fail — stopping")
                     if tg_token and tg_chat:
-                        send_tg(tg_token, tg_chat, "⚠️ 3x gagal! Check logs.")
+                        send_tg(tg_token, tg_chat, "⚠️ 5x gagal! Cek logs.")
                     break
                 time.sleep(interval)
                 continue
 
-            if not gpus:
+            if gql_data:
+                new_images = extract_images(gql_data)
+                if new_images:
+                    cached_images.update(new_images)
+
+            if status == "no_data":
                 fail_count += 1
                 log.warning(f"No data (fail #{fail_count})")
-                if fail_count >= 3:
-                    if tg_token and tg_chat:
-                        send_tg(tg_token, tg_chat, "⚠️ 3x no data! Check logs.")
+                if fail_count >= 5:
                     break
                 time.sleep(interval)
                 continue
 
             fail_count = 0
+            session_recovered_count = 0
             available = [g for g in gpus if g["in_stock"]]
 
             if not available:
@@ -332,11 +324,11 @@ async def run_monitor(interval, tg_token, tg_chat, auto_deploy):
                 time.sleep(interval)
                 continue
 
-            # === STOCK FOUND! ===
+            # STOCK FOUND
             target = available[0]
             region = target["regions"][0]
             ts = datetime.now().strftime("%H:%M:%S")
-            log.info(f"🟢 STOCK: {target['count']}x {target['model']} ({target['vram']}GB) region {region}")
+            log.info(f"🟢 STOCK at {ts}: {target['count']}x {target['model']} ({target['vram']}GB)")
 
             alert = (
                 f"🚨🚨🚨 *STOK ADA!!!* 🚨🚨🚨\n\n"
@@ -353,48 +345,14 @@ async def run_monitor(interval, tg_token, tg_chat, auto_deploy):
                 time.sleep(interval)
                 continue
 
-            # === FAST DEPLOY ===
-            alert += "\n⚡ Auto-deploying..."
+            alert += "\n⚡ Auto-deploying now..."
             if tg_token and tg_chat:
                 send_tg(tg_token, tg_chat, alert)
 
-            size_id = target["id"]
-            image_id = deploy_cache["images"].get("rocm") or deploy_cache["images"].get("ubuntu-24") or "195932981"
-
-            log.info(f"Deploy: size={size_id} image={image_id} region={region}")
-
-            try:
-                result = await deploy_gpu(check_page, size_id, image_id, region)
-
-                if "data" in result and result["data"].get("createDroplet", {}).get("droplet"):
-                    droplet = result["data"]["createDroplet"]["droplet"]
-                    msg = (
-                        f"🚀🚀🚀 *GPU DEPLOYED!!!* 🚀🚀🚀\n\n"
-                        f"✅ Name: `{droplet['name']}`\n"
-                        f"✅ ID: `{droplet['id']}`\n"
-                        f"🕐 {ts}\n\n"
-                        f"🔗 https://devcloud.amd.com/droplets/{droplet['id']}"
-                    )
-                    if tg_token and tg_chat:
-                        send_tg(tg_token, tg_chat, msg)
-                    log.info(f"✅ DEPLOYED! {droplet['name']} ({droplet['id']})")
-                    await ctx.close()
-                    return
-                elif "errors" in result:
-                    err = result["errors"][0].get("message", "unknown")
-                    log.error(f"Deploy error: {err}")
-                    if tg_token and tg_chat:
-                        send_tg(tg_token, tg_chat,
-                            f"🚨 Deploy gagal: `{err}`\n⚡ Manual: https://devcloud.amd.com/gpus")
-                else:
-                    log.error(f"Unexpected: {json.dumps(result)[:300]}")
-                    if tg_token and tg_chat:
-                        send_tg(tg_token, tg_chat, "🚨 Deploy error!\n⚡ https://devcloud.amd.com/gpus")
-            except Exception as e:
-                log.error(f"Deploy exception: {e}")
-                if tg_token and tg_chat:
-                    send_tg(tg_token, tg_chat,
-                        f"🚨 Deploy error: `{e}`\n⚡ https://devcloud.amd.com/gpus")
+            deployed = await do_deploy(ctx, available, cached_images, region, tg_token, tg_chat)
+            if deployed:
+                log.info("Deployed! Exiting.")
+                break
 
             time.sleep(interval)
 
@@ -402,6 +360,7 @@ async def run_monitor(interval, tg_token, tg_chat, auto_deploy):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("cookies", nargs="?", default=None, help="cookies.json path")
     parser.add_argument("--auto-deploy", "-a", action="store_true")
     args = parser.parse_args()
 
@@ -414,11 +373,18 @@ def main():
         log.error("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
         sys.exit(1)
 
-    if not Path(BROWSER_DATA_DIR).exists():
-        log.error("No session! Run: python3 monitor.py --setup cookies.json")
+    # Auto-find cookies.json if not specified
+    cookies_file = args.cookies
+    if not cookies_file:
+        default = Path(__file__).parent / "cookies.json"
+        if default.exists():
+            cookies_file = str(default)
+
+    if not cookies_file:
+        log.error("Usage: python telegram_alert.py cookies.json [--auto-deploy]")
         sys.exit(1)
 
-    asyncio.run(run_monitor(interval, tg_token, tg_chat, args.auto_deploy))
+    asyncio.run(run_monitor(interval, tg_token, tg_chat, args.auto_deploy, cookies_file))
 
 if __name__ == "__main__":
     main()
